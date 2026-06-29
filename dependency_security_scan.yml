@@ -1,0 +1,169 @@
+# =============================================================================
+# dependency_security_scan.yml
+# Description: Runs automated security and dependency scanning on every push
+#              and PR. Covers Python dependencies (Safety), container image
+#              vulnerabilities (Trivy), secret detection (Gitleaks), and
+#              static code analysis (Bandit).
+# Author:      Joshua Harvey
+# =============================================================================
+
+name: Security & Dependency Scan
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Run full scan every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents:      read
+  security-events: write   # Required to upload SARIF results to GitHub Security tab
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Python Dependency Vulnerability Scan (Safety)
+  # ---------------------------------------------------------------------------
+  python-dependency-scan:
+    name: Python Dependencies (Safety)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install safety
+          pip install -r requirements.txt || echo "No requirements.txt found — skipping install"
+
+      - name: Run Safety check
+        run: safety check --full-report
+        continue-on-error: true   # Report but don't block on warnings
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Secret Detection (Gitleaks)
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret Detection (Gitleaks)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history needed for accurate scanning
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Static Code Analysis (Bandit — Python SAST)
+  # ---------------------------------------------------------------------------
+  sast-scan:
+    name: Static Analysis (Bandit)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Bandit
+        run: pip install bandit[sarif]
+
+      - name: Run Bandit
+        run: |
+          bandit -r . \
+            --exclude ./.git,./tests,./venv \
+            --format sarif \
+            --output bandit-results.sarif \
+            --severity-level medium \
+            || true
+
+      - name: Upload Bandit SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: bandit-results.sarif
+          category:   bandit
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Container Image Scan (Trivy)
+  # ---------------------------------------------------------------------------
+  container-scan:
+    name: Container Image Scan (Trivy)
+    runs-on: ubuntu-latest
+    if: hashFiles('Dockerfile') != ''   # Only run if a Dockerfile exists
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image for scanning
+        run: docker build -t scan-target:${{ github.sha }} .
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:       "scan-target:${{ github.sha }}"
+          format:          "sarif"
+          output:          "trivy-results.sarif"
+          severity:        "CRITICAL,HIGH"
+          ignore-unfixed:  true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category:   trivy
+
+      - name: Fail on critical vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:    "scan-target:${{ github.sha }}"
+          format:       "table"
+          severity:     "CRITICAL"
+          exit-code:    "1"
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Infrastructure as Code Scan (Checkov — Terraform/Dockerfiles)
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    name: IaC Security Scan (Checkov)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory:       "."
+          framework:       "terraform,dockerfile,github_actions"
+          output_format:   "sarif"
+          output_file_path: checkov-results.sarif
+          soft_fail:       true
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category:   checkov
